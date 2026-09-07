@@ -24,6 +24,7 @@
 /* Standard AML IDs for an ECAM-capable PCI host bridge. */
 #define CID_PCI			"PNP0A03"
 #define HID_ECAM		"PNP0A08"
+#define HID_CPU			"ACPI0007"
 
 static int method_brsi_init(fwts_framework *fw)
 {
@@ -259,11 +260,73 @@ static int method_brsi_aml020(fwts_framework *fw)
 	return FWTS_OK;
 }
 
+static int method_brsi_aml030(fwts_framework *fw)
+{
+	fwts_list *methods;
+	fwts_list_link *item;
+	unsigned int under_sb = 0, under_pr = 0, elsewhere = 0;
+
+	if ((methods = fwts_acpi_object_get_names()) != NULL) {
+		fwts_list_foreach(item, methods) {
+			char *name = fwts_list_data(char *, item);
+			ACPI_HANDLE handle;
+			ACPI_DEVICE_INFO *info;
+			ACPI_STATUS status;
+
+			if (name == NULL)
+				continue;
+
+			status = AcpiGetHandle(NULL, name, &handle);
+			if (ACPI_FAILURE(status))
+				continue;
+
+			status = AcpiGetObjectInfo(handle, &info);
+			if (ACPI_FAILURE(status))
+				continue;
+
+			if (!(info->Valid & ACPI_VALID_HID) ||
+			    info->HardwareId.String == NULL ||
+			    strcmp(info->HardwareId.String, HID_CPU) != 0) {
+				ACPI_FREE(info);
+				continue;
+			}
+			ACPI_FREE(info);
+
+			fwts_log_info(fw, "AML_030: found "HID_CPU" at %s.", name);
+
+			if (strncmp(name, "\\_SB", 4) == 0)
+				under_sb++;
+			else if (strncmp(name, "\\_PR", 4) == 0)
+				under_pr++;
+			else
+				elsewhere++;
+		}
+	}
+
+	if (under_pr || elsewhere) {
+		fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_030",
+			"Per-hart "HID_CPU" objects must be under \\_SB, "
+			"not deprecated \\_PR (%u under \\_PR, %u elsewhere, "
+			"%u under \\_SB).",
+			under_pr, elsewhere, under_sb);
+	} else if (under_sb) {
+		fwts_passed(fw,
+			"AML_030: "HID_CPU" per-hart objects are under \\_SB.");
+	} else {
+		fwts_skipped(fw,
+			"AML_030: no "HID_CPU" per-hart objects found.");
+	}
+
+	return FWTS_OK;
+}
+
 static fwts_framework_minor_test method_brsi_tests[] = {
 	{ method_brsi_aml010,
 	  "AML_010: PCIe Root Complex _CRS SHOULD NOT return I/O ranges." },
 	{ method_brsi_aml020,
 	  "AML_020: _PRS and _SRS methods SHOULD NOT be implemented." },
+	{ method_brsi_aml030,
+	  "AML_030: per-hart devices MUST be under \\_SB, not \\_PR." },
 	{ NULL, NULL }
 };
 
