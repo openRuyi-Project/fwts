@@ -24,6 +24,7 @@
 /* Standard AML IDs for an ECAM-capable PCI host bridge. */
 #define CID_PCI			"PNP0A03"
 #define HID_ECAM		"PNP0A08"
+#define HID_CPU			"ACPI0007"
 
 static int method_brsi_init(fwts_framework *fw)
 {
@@ -306,11 +307,73 @@ static int method_brsi_aml020(fwts_framework *fw)
 	return FWTS_OK;
 }
 
+typedef struct {
+	fwts_framework *fw;
+	unsigned int under_sb;
+	unsigned int under_pr;
+	unsigned int elsewhere;
+} method_brsi_cpu_ctx;
+
+static ACPI_STATUS method_brsi_cpu_walk(
+	ACPI_HANDLE handle,
+	UINT32 nesting_level,
+	void *context,
+	void **return_value)
+{
+	method_brsi_cpu_ctx *ctx = context;
+	char path[128];
+
+	FWTS_UNUSED(nesting_level);
+	FWTS_UNUSED(return_value);
+
+	method_brsi_acpi_fullname(handle, path, sizeof(path));
+	fwts_log_info(ctx->fw, "AML_030: found %s at %s.", HID_CPU, path);
+
+	if (strncmp(path, "\\_SB", 4) == 0)
+		ctx->under_sb++;
+	else if (strncmp(path, "\\_PR", 4) == 0)
+		ctx->under_pr++;
+	else
+		ctx->elsewhere++;
+
+	return AE_OK;
+}
+
+static int method_brsi_aml030(fwts_framework *fw)
+{
+	method_brsi_cpu_ctx ctx;
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fw = fw;
+
+	AcpiGetDevices(HID_CPU, method_brsi_cpu_walk, &ctx, NULL);
+
+	if (ctx.under_pr || ctx.elsewhere) {
+		fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_030",
+			"Per-hart %s objects must be under \\_SB, "
+			"not deprecated \\_PR (%u under \\_PR, %u elsewhere, "
+			"%u under \\_SB).",
+			HID_CPU, ctx.under_pr, ctx.elsewhere, ctx.under_sb);
+	} else if (ctx.under_sb) {
+		fwts_passed(fw,
+			"AML_030: %s per-hart objects are under \\_SB.",
+			HID_CPU);
+	} else {
+		fwts_skipped(fw,
+			"AML_030: no %s per-hart objects found.",
+			HID_CPU);
+	}
+
+	return FWTS_OK;
+}
+
 static fwts_framework_minor_test method_brsi_tests[] = {
 	{ method_brsi_aml010,
 	  "AML_010: PCIe Root Complex _CRS SHOULD NOT return I/O ranges." },
 	{ method_brsi_aml020,
 	  "AML_020: _PRS and _SRS methods SHOULD NOT be implemented." },
+	{ method_brsi_aml030,
+	  "AML_030: per-hart devices MUST be under \\_SB, not \\_PR." },
 	{ NULL, NULL }
 };
 
