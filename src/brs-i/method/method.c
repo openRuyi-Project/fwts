@@ -1377,6 +1377,78 @@ static int method_brsi_aml060(fwts_framework *fw)
 	return FWTS_OK;
 }
 
+static int method_brsi_aml070(fwts_framework *fw)
+{
+	method_brsi_tad_ctx ctx;
+
+	/*
+	 * AML_070: a TAD must work with no vendor OS driver loaded.
+	 * fwts evaluates AML with its own ACPICA instance, which does not
+	 * use kernel I2C/SPI/UART drivers or GenericSerialBus handlers
+	 * installed in the in-kernel interpreter.
+	 */
+	fwts_log_info(fw,
+		"AML_070: evaluate TAD _GCP/_GRT/_SRT with fwts ACPICA. "
+		"This interpreter does not use kernel-loaded I2C/SPI/UART "
+		"drivers or in-kernel GenericSerialBus handlers.");
+	fwts_log_info(fw,
+		"AML_070: SystemMemory/SystemIO OperationRegions can work "
+		"here (same physical address as the kernel). GenericSerialBus "
+		"Field accesses usually fail in fwts even if a mainline bus "
+		"driver is bound and the same AML works in the kernel.");
+	fwts_log_info(fw,
+		"AML_070: a pass is stricter than \"works after the OS loads "
+		"a bus driver\". The driver-loaded OperationRegion switch "
+		"is not tested.");
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fw = fw;
+	ctx.id = "AML_070";
+
+	AcpiGetDevices(HID_TAD, method_brsi_tad_walk, &ctx, NULL);
+
+	if (ctx.found == 0) {
+		fwts_skipped(fw,
+			"AML_070: no Time and Alarm Device (HID %s) found; "
+			"requirement applies only when a TAD is implemented.",
+			HID_TAD);
+		return FWTS_OK;
+	}
+
+	if (ctx.failed) {
+		fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_070",
+			"%u of %u Time and Alarm Device(s) failed _GCP, _GRT "
+			"or _SRT under fwts ACPICA.",
+			ctx.failed, ctx.found);
+		fwts_advice(fw,
+			"AML_070 requires a TAD to work without extra "
+			"system-specific OS drivers. fwts uses a private "
+			"ACPICA instance: kernel I2C/SPI/UART drivers do "
+			"not install GenericSerialBus handlers for this "
+			"evaluator. A failure often means _GRT/_SRT only "
+			"work through a driver-backed GenericSerialBus "
+			"OperationRegion. Confirm whether a SystemMemory "
+			"fallback exists for the no-driver path. A kernel "
+			"success with drivers loaded does not satisfy this "
+			"fwts check. The AML switch onto a driver-backed "
+			"region after the driver loads is not tested.");
+	} else {
+		fwts_passed(fw,
+			"AML_070: %u Time and Alarm Device(s) are functional "
+			"under fwts ACPICA without kernel bus drivers.",
+			ctx.found);
+		fwts_advice(fw,
+			"This pass means _GCP/_GRT/_SRT ran in fwts ACPICA "
+			"with no kernel GenericSerialBus handler, which is "
+			"stricter than \"the TAD works once a mainline I2C/"
+			"SPI/UART driver is bound\". It does not verify that "
+			"AML later switches to a driver-backed OperationRegion "
+			"when that driver is loaded.");
+	}
+
+	return FWTS_OK;
+}
+
 static int options_handler(
 	fwts_framework *fw,
 	int argc,
@@ -1433,6 +1505,8 @@ static fwts_framework_minor_test method_brsi_tests[] = {
 	  "AML_050: processor idle states MUST be described using _LPI." },
 	{ method_brsi_aml060,
 	  "AML_060: TAD with _GCP bit 2, _GRT and _SRT if RTC is on an OS-managed bus." },
+	{ method_brsi_aml070,
+	  "AML_070: TAD MUST work in fwts ACPICA without kernel bus drivers." },
 	{ NULL, NULL }
 };
 
