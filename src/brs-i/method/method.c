@@ -18,8 +18,12 @@
 #include "fwts.h"
 
 #if defined(FWTS_HAS_ACPI) && (FWTS_ARCH_RISCV)
-
 #include "fwts_acpi_object_eval.h"
+#include <acmacros.h>
+#include <aclocal.h>
+#include <acobject.h>
+#include <acstruct.h>
+#include <acutils.h>
 
 /* Standard AML IDs for an ECAM-capable PCI host bridge. */
 #define CID_PCI			"PNP0A03"
@@ -1438,6 +1442,184 @@ static int method_brsi_aml060(fwts_framework *fw)
 	return FWTS_OK;
 }
 
+
+
+typedef struct {
+	fwts_framework *fw;
+	bool has_gsbus;
+	bool has_sysmem;
+	bool has_sysio;
+	bool has_other;
+	unsigned int regions;
+} method_brsi_region_info;
+
+typedef struct {
+	fwts_framework *fw;
+	unsigned int found;
+	unsigned int used_gsbus;
+	unsigned int no_fallback;
+} method_brsi_aml070_ctx;
+
+static ACPI_STATUS method_brsi_region_walk(
+	ACPI_HANDLE handle,
+	UINT32 nesting_level,
+	void *context,
+	void **return_value)
+{
+	method_brsi_region_info *info = context;
+	ACPI_NAMESPACE_NODE *node;
+	ACPI_OPERAND_OBJECT *obj;
+	UINT8 space_id;
+	char name[128];
+	const char *space;
+
+	FWTS_UNUSED(nesting_level);
+	FWTS_UNUSED(return_value);
+
+	node = ACPI_CAST_PTR(ACPI_NAMESPACE_NODE, handle);
+	if (node == NULL || node->Object == NULL)
+		return AE_OK;
+
+	obj = node->Object;
+	if (obj->Common.Type != ACPI_TYPE_REGION)
+		return AE_OK;
+
+	space_id = obj->Region.SpaceId;
+	info->regions++;
+
+	switch (space_id) {
+	case ACPI_ADR_SPACE_GSBUS:
+		info->has_gsbus = true;
+		space = "GenericSerialBus";
+		break;
+	case ACPI_ADR_SPACE_SYSTEM_MEMORY:
+		info->has_sysmem = true;
+		space = "SystemMemory";
+		break;
+	case ACPI_ADR_SPACE_SYSTEM_IO:
+		info->has_sysio = true;
+		space = "SystemIO";
+		break;
+	default:
+		info->has_other = true;
+		space = AcpiUtGetRegionName(space_id);
+		break;
+	}
+
+	method_brsi_acpi_fullname(handle, name, sizeof(name));
+	fwts_log_info(info->fw, "AML_070: %s OperationRegion SpaceId=%s.",
+		name[0] ? name : "(unknown)", space);
+
+	return AE_OK;
+}
+
+static ACPI_STATUS method_brsi_aml070_walk(
+	ACPI_HANDLE handle,
+	UINT32 nesting_level,
+	void *context,
+	void **return_value)
+{
+	method_brsi_aml070_ctx *ctx = context;
+	method_brsi_region_info info;
+	char device_path[128];
+
+	FWTS_UNUSED(nesting_level);
+	FWTS_UNUSED(return_value);
+
+	ctx->found++;
+	method_brsi_acpi_fullname(handle, device_path, sizeof(device_path));
+	fwts_log_info(ctx->fw, "AML_070: found TAD %s (HID %s).",
+		device_path, HID_TAD);
+
+	memset(&info, 0, sizeof(info));
+	info.fw = ctx->fw;
+	AcpiWalkNamespace(ACPI_TYPE_REGION, handle, ACPI_UINT32_MAX,
+		method_brsi_region_walk, NULL, &info, NULL);
+
+	if (info.regions == 0) {
+		fwts_log_info(ctx->fw,
+			"AML_070: %s has no OperationRegion under the device.",
+			device_path);
+		return AE_OK;
+	}
+
+	fwts_log_info(ctx->fw,
+		"AML_070: %s has %u OperationRegion(s) "
+		"(GenericSerialBus=%s SystemMemory=%s SystemIO=%s).",
+		device_path, info.regions,
+		info.has_gsbus ? "yes" : "no",
+		info.has_sysmem ? "yes" : "no",
+		info.has_sysio ? "yes" : "no");
+
+	if (info.has_gsbus) {
+		ctx->used_gsbus++;
+		if (!info.has_sysmem && !info.has_sysio)
+			ctx->no_fallback++;
+	}
+
+	return AE_OK;
+}
+
+static int method_brsi_aml070(fwts_framework *fw)
+{
+	method_brsi_aml070_ctx ctx;
+
+	/*
+	 * AML_070: TAD must work with no vendor OS driver.
+	 * fwts ACPICA installs simulated address-space handlers, including
+	 * GenericSerialBus, so this test only inspects OperationRegion
+	 * SpaceIds and does not treat simulated accesses as compliance.
+	 */
+	fwts_log_info(fw,
+		"AML_070: inspect TAD OperationRegion SpaceIds. "
+		"fwts simulates SystemMemory, SystemIO and GenericSerialBus.");
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fw = fw;
+
+	AcpiGetDevices(HID_TAD, method_brsi_aml070_walk, &ctx, NULL);
+
+	if (ctx.found == 0) {
+		fwts_skipped(fw,
+			"AML_070: no Time and Alarm Device (HID %s) found; "
+			"requirement applies only when a TAD is implemented.",
+			HID_TAD);
+		return FWTS_OK;
+	}
+
+	if (ctx.no_fallback) {
+		fwts_warning(fw,
+			"AML_070: %u of %u TAD(s) use GenericSerialBus "
+			"with no SystemMemory/SystemIO OperationRegion. "
+			"That path normally needs a bus driver; fwts "
+			"cannot prove a no-driver fallback exists.",
+			ctx.no_fallback, ctx.found);
+		fwts_advice(fw,
+			"AML_070 requires the TAD to work without a vendor "
+			"OS driver. A SystemMemory or SystemIO fallback "
+			"region is the usual no-driver path. GenericSerialBus "
+			"alone is not sufficient evidence of compliance, and "
+			"fwts simulated GSBUS handlers must not be treated "
+			"as a pass.");
+	} else if (ctx.used_gsbus) {
+		fwts_skipped(fw,
+			"AML_070: %u of %u TAD(s) declare GenericSerialBus "
+			"and also SystemMemory/SystemIO. fwts simulates "
+			"both, so this does not establish which path AML "
+			"takes without a bus driver.",
+			ctx.used_gsbus, ctx.found);
+	} else {
+		fwts_skipped(fw,
+			"AML_070: %u TAD(s) have no GenericSerialBus "
+			"OperationRegion. Region accesses are still "
+			"simulated by fwts, so this is not treated as "
+			"AML_070 compliance.",
+			ctx.found);
+	}
+
+	return FWTS_OK;
+}
+
 static int options_handler(
 	fwts_framework *fw,
 	int argc,
@@ -1489,6 +1671,8 @@ static fwts_framework_minor_test method_brsi_tests[] = {
 	  "AML_050: processor idle states MUST be described using _LPI." },
 	{ method_brsi_aml060,
 	  "AML_060: TAD with _GCP bit 2, _GRT and _SRT if RTC is on an OS-managed bus." },
+	{ method_brsi_aml070,
+	  "AML_070: TAD MUST work in fwts ACPICA without kernel bus drivers." },
 	{ NULL, NULL }
 };
 
