@@ -34,6 +34,13 @@
 #define HID_TAD			"ACPI000E"
 #define HID_PLIC		"RSCV0001"
 #define HID_APLIC		"RSCV0002"
+#define HID_UART		"RSCV0003"
+
+/* Device Properties UUID: daffd814-6eba-4d8c-8a91-bc9bbf4aa301 */
+static const uint8_t dsd_devprop_uuid[16] = {
+	0x14, 0xd8, 0xff, 0xda, 0xba, 0x6e, 0x8c, 0x4d,
+	0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3, 0x01
+};
 
 /* RISC-V FFH LPI entry method types (bits[63:60]). */
 #define LPI_FFH_TYPE_WFI		0x0
@@ -1707,6 +1714,201 @@ static int method_brsi_aml080(fwts_framework *fw)
 	return FWTS_OK;
 }
 
+typedef struct {
+	fwts_framework *fw;
+	unsigned int found;
+	unsigned int failed;
+	bool clock_ok;
+} method_brsi_uart_ctx;
+
+static bool method_brsi_dsd_uuid_match(const ACPI_OBJECT *obj)
+{
+	if (obj == NULL || obj->Type != ACPI_TYPE_BUFFER)
+		return false;
+	if (obj->Buffer.Length != sizeof(dsd_devprop_uuid))
+		return false;
+	return memcmp(obj->Buffer.Pointer, dsd_devprop_uuid,
+		sizeof(dsd_devprop_uuid)) == 0;
+}
+
+static void method_brsi_uart_dsd_return(
+	fwts_framework *fw,
+	char *name,
+	ACPI_BUFFER *buf,
+	ACPI_OBJECT *obj,
+	void *private)
+{
+	method_brsi_uart_ctx *ctx = private;
+	uint32_t i, j;
+
+	FWTS_UNUSED(buf);
+
+	if (obj == NULL || obj->Type != ACPI_TYPE_PACKAGE) {
+		fwts_log_info(fw, "AML_090: %s did not return a Package.", name);
+		return;
+	}
+
+	if (obj->Package.Count & 1) {
+		fwts_log_info(fw,
+			"AML_090: %s must contain UUID/data pairs "
+			"(even element count), got %" PRIu32 ".",
+			name, obj->Package.Count);
+		return;
+	}
+
+	for (i = 0; i < obj->Package.Count; i += 2) {
+		ACPI_OBJECT *uuid = &obj->Package.Elements[i];
+		ACPI_OBJECT *data = &obj->Package.Elements[i + 1];
+
+		if (!method_brsi_dsd_uuid_match(uuid))
+			continue;
+		if (data->Type != ACPI_TYPE_PACKAGE) {
+			fwts_log_info(fw,
+				"AML_090: %s Device Properties data is not "
+				"a Package.",
+				name);
+			return;
+		}
+
+		for (j = 0; j < data->Package.Count; j++) {
+			ACPI_OBJECT *prop = &data->Package.Elements[j];
+			ACPI_OBJECT *key, *val;
+			const char *keystr;
+			uint64_t valint;
+
+			if (prop->Type != ACPI_TYPE_PACKAGE ||
+			    prop->Package.Count < 2) {
+				fwts_log_info(fw,
+					"AML_090: %s property %" PRIu32
+					" is not a 2-element Package.",
+					name, j);
+				continue;
+			}
+
+			key = &prop->Package.Elements[0];
+			val = &prop->Package.Elements[1];
+
+			if (key->Type != ACPI_TYPE_STRING) {
+				fwts_log_info(fw,
+					"AML_090: %s property %" PRIu32
+					" name is not a String.",
+					name, j);
+				continue;
+			}
+			keystr = key->String.Pointer;
+
+			if (val->Type != ACPI_TYPE_INTEGER) {
+				fwts_log_info(fw,
+					"AML_090: %s property \"%s\" is not "
+					"an Integer.",
+					name, keystr);
+				continue;
+			}
+			valint = val->Integer.Value;
+
+			fwts_log_info(fw,
+				"AML_090: %s \"%s\" = %" PRIu64 ".",
+				name, keystr, valint);
+
+			if (strcmp(keystr, "clock-frequency") == 0) {
+				if (valint != 0)
+					ctx->clock_ok = true;
+				else
+					fwts_log_info(fw,
+						"AML_090: %s clock-frequency "
+						"is 0; baud rate cannot be set.",
+						name);
+			}
+
+			if (strcmp(keystr, "reg-io-width") == 0) {
+				if (valint != 1 && valint != 2 &&
+						valint != 4 && valint != 8)
+					fwts_log_info(fw,
+						"AML_090: %s reg-io-width "
+						"must be 1, 2, 4 or 8.",
+						name);
+			}
+		}
+		return;
+	}
+
+	fwts_log_info(fw,
+		"AML_090: %s has no Device Properties UUID "
+		"(daffd814-6eba-4d8c-8a91-bc9bbf4aa301).",
+		name);
+}
+
+static ACPI_STATUS method_brsi_uart_walk(
+	ACPI_HANDLE handle,
+	UINT32 nesting_level,
+	void *context,
+	void **return_value)
+{
+	method_brsi_uart_ctx *ctx = context;
+	char device_path[128];
+
+	FWTS_UNUSED(nesting_level);
+	FWTS_UNUSED(return_value);
+
+	ctx->found++;
+	ctx->clock_ok = false;
+
+	method_brsi_acpi_fullname(handle, device_path, sizeof(device_path));
+
+	fwts_log_info(ctx->fw, "AML_090: found UART %s (HID %s).",
+		device_path, HID_UART);
+
+	if (fwts_evaluate_method(ctx->fw, METHOD_MANDATORY | METHOD_SILENT,
+			&handle, "_DSD", NULL, 0,
+			method_brsi_uart_dsd_return, ctx) != FWTS_OK)
+		fwts_log_info(ctx->fw,
+			"AML_090: %s._DSD is mandatory but missing or failed "
+			"to evaluate.",
+			device_path);
+
+	if (!ctx->clock_ok)
+		ctx->failed++;
+
+	return AE_OK;
+}
+
+static int method_brsi_aml090(fwts_framework *fw)
+{
+	method_brsi_uart_ctx ctx;
+
+	/*
+	 * AML_090: RSCV0003 UART devices must implement the UART device
+	 * properties (BRS acpi-prop.adoc) via _DSD Device Properties UUID.
+	 * clock-frequency is required and must be a non-zero Integer.
+	 */
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fw = fw;
+
+	AcpiGetDevices(HID_UART, method_brsi_uart_walk, &ctx, NULL);
+
+	if (ctx.found == 0) {
+		fwts_skipped(fw,
+			"AML_090: no UART device (HID %s) found; UART "
+			"properties are required on those objects when they "
+			"exist.",
+			HID_UART);
+		return FWTS_OK;
+	}
+
+	if (ctx.failed)
+		fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_090",
+			"%u of %u UART device(s) (HID %s) missing a non-zero "
+			"clock-frequency in _DSD Device Properties.",
+			ctx.failed, ctx.found, HID_UART);
+	else
+		fwts_passed(fw,
+			"AML_090: %u UART device(s) (HID %s) implement "
+			"clock-frequency in _DSD Device Properties.",
+			ctx.found, HID_UART);
+
+	return FWTS_OK;
+}
+
 static int options_handler(
 	fwts_framework *fw,
 	int argc,
@@ -1762,6 +1964,8 @@ static fwts_framework_minor_test method_brsi_tests[] = {
 	  "AML_070: TAD MUST work in fwts ACPICA without kernel bus drivers." },
 	{ method_brsi_aml080,
 	  "AML_080: PLIC and APLIC devices MUST implement _GSB." },
+	{ method_brsi_aml090,
+	  "AML_090: RSCV0003 UART devices MUST implement UART device properties." },
 	{ NULL, NULL }
 };
 
