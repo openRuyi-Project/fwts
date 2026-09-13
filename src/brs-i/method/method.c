@@ -25,6 +25,29 @@
 #define CID_PCI			"PNP0A03"
 #define HID_ECAM		"PNP0A08"
 #define HID_CPU			"ACPI0007"
+#define HID_CONTAINER		"ACPI0010"
+
+/* RISC-V FFH LPI entry method types (bits[63:60]). */
+#define LPI_FFH_TYPE_WFI		0x0
+#define LPI_FFH_TYPE_SBI_HSM		0x1
+
+/* Indices into the _LPI package (ACPI 8.4.4.3). */
+#define LPI_IDX_REVISION		0
+#define LPI_IDX_LEVELID			1
+#define LPI_IDX_COUNT			2
+#define LPI_STATE_FIRST			3
+#define LPI_STATE_MIN_ENT		7
+#define LPI_ST_MIN_RESIDENCY		0
+#define LPI_ST_WAKE_LATENCY		1
+#define LPI_ST_FLAGS			2
+#define LPI_ST_ARCH_FLAGS		3
+#define LPI_ST_RES_FREQ			4
+#define LPI_ST_PARENT_STATE		5
+#define LPI_ST_ENTRY_METHOD		6
+#define LPI_ST_RES_COUNTER		7
+#define LPI_ST_USAGE_COUNTER		8
+#define LPI_ST_NAME			9
+#define LPI_ARCH_FLAGS_RESERVED_MASK	(~0x1ULL)
 
 /* Generic Register Descriptor (ACPI 6.4.3.7): 0x82 + length word + 12-byte GAS. */
 #define AML_GENERIC_REG_DESC		0x82
@@ -51,6 +74,7 @@
 #define CPC_IDX_REF_CTR			13
 #define CPC_IDX_DELIVERED_CTR		14
 
+static bool no_os_idle_states;
 static bool no_os_perf_ctrl;
 
 static int method_brsi_init(fwts_framework *fw)
@@ -720,6 +744,442 @@ static int method_brsi_aml040(fwts_framework *fw)
 	return FWTS_OK;
 }
 
+typedef struct {
+	fwts_framework *fw;
+	unsigned int harts;
+	unsigned int containers;
+	unsigned int with_lpi;
+	unsigned int failed;
+} method_brsi_lpi_ctx;
+
+static bool method_brsi_lpi_entry_ok(
+	fwts_framework *fw,
+	const char *path,
+	unsigned int state,
+	const ACPI_OBJECT *obj)
+{
+	fwts_acpi_gas gas;
+	bool is_null = true;
+	uint64_t addr;
+	uint8_t type;
+	uint32_t mid;
+
+	/*
+	 * ACPI allows Entry Method to be an Integer (OS-initiated
+	 * composition) or a Generic Register Descriptor Buffer.
+	 * RISC-V FFH describes WFI / SBI HSM via FFixedHW buffers.
+	 */
+	if (obj->Type == ACPI_TYPE_INTEGER) {
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u Entry Method = "
+			"Integer 0x%" PRIx64 ".",
+			path, state, (uint64_t)obj->Integer.Value);
+		return true;
+	}
+
+	if (!method_brsi_cpc_parse_reg(obj, &gas, &is_null) || is_null) {
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u Entry Method is missing, "
+			"malformed or a NULL register.",
+			path, state);
+		return false;
+	}
+
+	fwts_log_info(fw,
+		"AML_050: %s._LPI state %u Entry Method space=0x%" PRIx8
+		" width=%u addr=0x%" PRIx64 ".",
+		path, state, gas.address_space_id,
+		gas.register_bit_width, (uint64_t)gas.address);
+
+	if (gas.address_space_id != ACPI_ADR_SPACE_FFH)
+		return true;
+
+	addr = gas.address;
+	type = (addr >> 60) & 0xf;
+	mid = (addr >> 32) & 0xfffffff;
+
+	if (gas.register_bit_width != 64 ||
+	    gas.register_bit_offset != 0 ||
+	    gas.access_width != 4) {
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u FFixedHW Entry Method "
+			"must be 64-bit, offset 0, AccessSize QWord.",
+			path, state);
+		return false;
+	}
+	if (mid != 0) {
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u FFixedHW bits[59:32] "
+			"must be 0.",
+			path, state);
+		return false;
+	}
+	if (type != LPI_FFH_TYPE_WFI && type != LPI_FFH_TYPE_SBI_HSM) {
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u FFixedHW type 0x%x is "
+			"reserved (want 0x0 WFI or 0x1 SBI HSM).",
+			path, state, type);
+		return false;
+	}
+	if (type == LPI_FFH_TYPE_WFI && (addr & 0xffffffffULL) != 0) {
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u WFI Entry Method "
+			"bits[31:0] must be 0.",
+			path, state);
+		return false;
+	}
+
+	return true;
+}
+
+static bool method_brsi_lpi_state_ok(
+	fwts_framework *fw,
+	const char *path,
+	unsigned int state,
+	const ACPI_OBJECT *pkg)
+{
+	bool rc = true;
+
+	/*
+	 * State package type and element types (Integer/Buffer/String) are
+	 * already checked by src/acpi/method/method.c (method_test_LPI_return).
+	 * Only RISC-V BRS-I field semantics remain here.
+	 */
+	if (pkg->Type != ACPI_TYPE_PACKAGE ||
+	    pkg->Package.Count < LPI_STATE_MIN_ENT)
+		return false;
+
+	if (pkg->Package.Count > LPI_ST_ARCH_FLAGS &&
+	    pkg->Package.Elements[LPI_ST_ARCH_FLAGS].Type == ACPI_TYPE_INTEGER) {
+		uint64_t arch =
+			pkg->Package.Elements[LPI_ST_ARCH_FLAGS].Integer.Value;
+
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u MinResidency=%" PRIu64
+			" WakeLatency=%" PRIu64 " Flags=0x%" PRIx64
+			" ArchFlags=0x%" PRIx64 ".",
+			path, state,
+			(uint64_t)pkg->Package.Elements[LPI_ST_MIN_RESIDENCY].Integer.Value,
+			(uint64_t)pkg->Package.Elements[LPI_ST_WAKE_LATENCY].Integer.Value,
+			(uint64_t)pkg->Package.Elements[LPI_ST_FLAGS].Integer.Value,
+			arch);
+		if (arch & LPI_ARCH_FLAGS_RESERVED_MASK) {
+			fwts_log_info(fw,
+				"AML_050: %s._LPI state %u Arch. Context Lost "
+				"Flags 0x%" PRIx64 " has reserved bits set "
+				"(RISC-V FFH only allows bit 0).",
+				path, state, arch);
+			rc = false;
+		}
+	}
+
+	if (pkg->Package.Count > LPI_ST_ENTRY_METHOD &&
+	    !method_brsi_lpi_entry_ok(fw, path, state,
+			&pkg->Package.Elements[LPI_ST_ENTRY_METHOD]))
+		rc = false;
+
+	if (pkg->Package.Count > LPI_ST_NAME &&
+	    pkg->Package.Elements[LPI_ST_NAME].Type == ACPI_TYPE_STRING &&
+	    pkg->Package.Elements[LPI_ST_NAME].String.Pointer)
+		fwts_log_info(fw,
+			"AML_050: %s._LPI state %u Name=\"%s\".",
+			path, state,
+			pkg->Package.Elements[LPI_ST_NAME].String.Pointer);
+
+	return rc;
+}
+
+typedef enum {
+	METHOD_BRSI_LPI_ABSENT = 0,
+	METHOD_BRSI_LPI_BAD,
+	METHOD_BRSI_LPI_OK
+} method_brsi_lpi_rc;
+
+static method_brsi_lpi_rc method_brsi_lpi_eval(
+	fwts_framework *fw,
+	ACPI_HANDLE handle,
+	const char *path)
+{
+	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
+	ACPI_OBJECT *obj;
+	ACPI_STATUS status;
+	uint64_t rev, count;
+	unsigned int i;
+	bool rc = true;
+
+	status = AcpiEvaluateObject(handle, "_LPI", NULL, &buf);
+	if (ACPI_FAILURE(status) || buf.Pointer == NULL)
+		return METHOD_BRSI_LPI_ABSENT;
+
+	obj = buf.Pointer;
+	/*
+	 * Package type, Revision/LevelID/Count types, revision==0, Count vs
+	 * number of state packages, and per-state element types are already
+	 * validated by src/acpi/method/method.c (method_test_LPI_return).
+	 */
+	if (obj->Type != ACPI_TYPE_PACKAGE ||
+	    obj->Package.Count < LPI_STATE_FIRST + 1) {
+		fwts_log_info(fw,
+			"AML_050: %s._LPI is not a usable Package; see the "
+			"generic method _LPI test.",
+			path);
+		ACPI_FREE(buf.Pointer);
+		return METHOD_BRSI_LPI_BAD;
+	}
+
+	rev = (obj->Package.Elements[LPI_IDX_REVISION].Type ==
+		ACPI_TYPE_INTEGER) ?
+		obj->Package.Elements[LPI_IDX_REVISION].Integer.Value : 0;
+	count = (obj->Package.Elements[LPI_IDX_COUNT].Type ==
+		ACPI_TYPE_INTEGER) ?
+		obj->Package.Elements[LPI_IDX_COUNT].Integer.Value : 0;
+
+	fwts_log_info(fw,
+		"AML_050: %s._LPI revision=%" PRIu64 " LevelID=0x%" PRIx64
+		" Count=%" PRIu64 " (package count %u).",
+		path, rev,
+		obj->Package.Elements[LPI_IDX_LEVELID].Type == ACPI_TYPE_INTEGER ?
+			(uint64_t)obj->Package.Elements[LPI_IDX_LEVELID].Integer.Value : 0,
+		count, obj->Package.Count);
+
+	for (i = LPI_STATE_FIRST; i < obj->Package.Count; i++) {
+		if (!method_brsi_lpi_state_ok(fw, path,
+				i - LPI_STATE_FIRST + 1,
+				&obj->Package.Elements[i]))
+			rc = false;
+	}
+
+	ACPI_FREE(buf.Pointer);
+	return rc ? METHOD_BRSI_LPI_OK : METHOD_BRSI_LPI_BAD;
+}
+
+/*
+ * Idle states may be declared on the hart (ACPI0007) or on an ancestor
+ * Processor Container (ACPI0010). Walk parents until a usable _LPI is
+ * found or the root is reached.
+ */
+static bool method_brsi_lpi_on_hierarchy(
+	fwts_framework *fw,
+	ACPI_HANDLE handle,
+	const char *path)
+{
+	ACPI_HANDLE cur = handle;
+	char cur_path[128];
+	unsigned int depth = 0;
+
+	strncpy(cur_path, path, sizeof(cur_path) - 1);
+	cur_path[sizeof(cur_path) - 1] = '\0';
+
+	while (cur && depth < 16) {
+		ACPI_HANDLE parent;
+		ACPI_DEVICE_INFO *info;
+
+		switch (method_brsi_lpi_eval(fw, cur, cur_path)) {
+		case METHOD_BRSI_LPI_OK:
+			if (cur != handle)
+				fwts_log_info(fw,
+					"AML_050: %s inherits _LPI from "
+					"ancestor %s.",
+					path, cur_path);
+			return true;
+		case METHOD_BRSI_LPI_BAD:
+			return false;
+		case METHOD_BRSI_LPI_ABSENT:
+		default:
+			break;
+		}
+
+		if (ACPI_FAILURE(AcpiGetParent(cur, &parent)) ||
+		    parent == NULL || parent == cur)
+			break;
+
+		info = NULL;
+		if (ACPI_SUCCESS(AcpiGetObjectInfo(parent, &info))) {
+			bool is_container = (info->Valid & ACPI_VALID_HID) &&
+				info->HardwareId.String &&
+				strcmp(info->HardwareId.String,
+					HID_CONTAINER) == 0;
+			ACPI_FREE(info);
+			if (!is_container)
+				break;
+		} else {
+			break;
+		}
+
+		cur = parent;
+		method_brsi_acpi_fullname(cur, cur_path, sizeof(cur_path));
+		depth++;
+	}
+
+	fwts_log_info(fw,
+		"AML_050: %s has no usable _LPI on the device or an "
+		HID_CONTAINER" ancestor.",
+		path);
+	return false;
+}
+
+static ACPI_STATUS method_brsi_lpi_walk(
+	ACPI_HANDLE handle,
+	UINT32 nesting_level,
+	void *context,
+	void **return_value)
+{
+	method_brsi_lpi_ctx *ctx = context;
+	char device_path[128];
+
+	FWTS_UNUSED(nesting_level);
+	FWTS_UNUSED(return_value);
+
+	ctx->harts++;
+	method_brsi_acpi_fullname(handle, device_path, sizeof(device_path));
+
+	fwts_log_info(ctx->fw, "AML_050: found per-hart device %s.",
+		device_path);
+
+	if (method_brsi_lpi_on_hierarchy(ctx->fw, handle, device_path))
+		ctx->with_lpi++;
+	else
+		ctx->failed++;
+
+	return AE_OK;
+}
+
+static ACPI_STATUS method_brsi_lpi_container_walk(
+	ACPI_HANDLE handle,
+	UINT32 nesting_level,
+	void *context,
+	void **return_value)
+{
+	method_brsi_lpi_ctx *ctx = context;
+	char device_path[128];
+
+	FWTS_UNUSED(nesting_level);
+	FWTS_UNUSED(return_value);
+
+	ctx->containers++;
+	method_brsi_acpi_fullname(handle, device_path, sizeof(device_path));
+
+	fwts_log_info(ctx->fw,
+		"AML_050: found Processor Container %s.", device_path);
+
+	/*
+	 * Containers are optional LPI nodes. Validate _LPI when present;
+	 * absence is not a failure (the leaf hart may carry the states).
+	 */
+	if (method_brsi_lpi_eval(ctx->fw, handle, device_path) ==
+	    METHOD_BRSI_LPI_OK)
+		fwts_log_info(ctx->fw,
+			"AML_050: %s exposes a usable container _LPI.",
+			device_path);
+
+	return AE_OK;
+}
+
+static unsigned int method_brsi_count_cstate(fwts_framework *fw)
+{
+	fwts_list *methods;
+	fwts_list_link *item;
+	unsigned int n = 0;
+
+	methods = fwts_acpi_object_get_names();
+	if (methods == NULL)
+		return 0;
+
+	fwts_list_foreach(item, methods) {
+		char *name = fwts_list_data(char *, item);
+		size_t len;
+
+		if (name == NULL)
+			continue;
+		len = strlen(name);
+		if (len < 4)
+			continue;
+		if (strncmp(name + len - 4, "_CST", 4) != 0 &&
+		    strncmp(name + len - 4, "_CSD", 4) != 0)
+			continue;
+
+		fwts_log_info(fw,
+			"AML_050: found legacy C-state method %s.", name);
+		n++;
+	}
+
+	return n;
+}
+
+static int method_brsi_aml050(fwts_framework *fw)
+{
+	method_brsi_lpi_ctx ctx;
+	unsigned int cstate;
+
+	/*
+	 * AML_050: processor idle states MUST be described using _LPI
+	 * (ACPI 8.4.3 / 8.4.4), not legacy _CST/_CSD C-states.
+	 * --brs-i-no-os-idle-states declares that the platform exposes
+	 * no OS-directed hart idle states.
+	 */
+	if (no_os_idle_states) {
+		fwts_skipped(fw,
+			"AML_050: --brs-i-no-os-idle-states specified; "
+			"platform does not describe OS-directed hart idle "
+			"states, _LPI is not required.");
+		return FWTS_OK;
+	}
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fw = fw;
+
+	AcpiGetDevices(HID_CPU, method_brsi_lpi_walk, &ctx, NULL);
+	AcpiGetDevices(HID_CONTAINER,
+		method_brsi_lpi_container_walk, &ctx, NULL);
+
+	cstate = method_brsi_count_cstate(fw);
+
+	if (ctx.harts == 0) {
+		if (cstate) {
+			fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_050",
+				"Found %u legacy C-state method(s) (_CST/"
+				"_CSD) but no per-hart "HID_CPU" objects "
+				"with _LPI. BRS-I requires processor idle "
+				"states via Low Power Idle (_LPI), not "
+				"C-states.",
+				cstate);
+		} else {
+			fwts_skipped(fw,
+				"AML_050: no "HID_CPU" per-hart objects "
+				"found; skipping _LPI check. Re-run with "
+				"--brs-i-no-os-idle-states if this platform "
+				"does not describe processor idle states.");
+		}
+		return FWTS_OK;
+	}
+
+	if (ctx.failed || cstate) {
+		fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_050",
+			"%u of %u per-hart object(s) failed Low Power Idle "
+			"(_LPI)%s. Processor idle states MUST be described "
+			"using _LPI (ACPI 8.4.3). Re-run with --brs-i-no-os-idle-states "
+			"if this platform has no OS-directed idle states.",
+			ctx.failed, ctx.harts,
+			cstate ? "; legacy C-state methods are present" : "");
+		if (cstate)
+			fwts_advice(fw,
+				"Replace _CST/_CSD C-state objects with "
+				"per-hart or Processor Container _LPI "
+				"packages. On RISC-V the Entry Method "
+				"typically uses an FFixedHW descriptor "
+				"encoding WFI (type 0) or SBI HSM suspend "
+				"(type 1).");
+	} else {
+		fwts_passed(fw,
+			"AML_050: %u per-hart object(s) describe idle "
+			"states via _LPI (%u Processor Container(s) "
+			"examined).",
+			ctx.with_lpi, ctx.containers);
+	}
+
+	return FWTS_OK;
+}
+
 static int options_handler(
 	fwts_framework *fw,
 	int argc,
@@ -737,6 +1197,11 @@ static int options_handler(
 			fwts_log_info(fw,
 				"BRS-I: no OS-directed hart performance control, skip AML_040 check");
 			break;
+		case 1:	/* --brs-i-no-os-idle-states */
+			no_os_idle_states = true;
+			fwts_log_info(fw,
+				"BRS-I: no OS-directed hart idle states, skip AML_050 check");
+			break;
 		}
 	}
 	return FWTS_OK;
@@ -745,6 +1210,8 @@ static int options_handler(
 static fwts_option options[] = {
 	{ "brs-i-no-os-perf-ctrl", "", 0,
 	  "Platform has no OS-directed hart performance control (skip AML_040)" },
+	{ "brs-i-no-os-idle-states", "", 0,
+	  "Platform has no OS-directed hart idle states (skip AML_050)" },
 	{ NULL, NULL, 0, NULL }
 };
 
@@ -757,6 +1224,8 @@ static fwts_framework_minor_test method_brsi_tests[] = {
 	  "AML_030: per-hart devices MUST be under \\_SB, not \\_PR." },
 	{ method_brsi_aml040,
 	  "AML_040: OS-directed hart performance control MUST use CPPC (_CPC)." },
+	{ method_brsi_aml050,
+	  "AML_050: processor idle states MUST be described using _LPI." },
 	{ NULL, NULL }
 };
 
