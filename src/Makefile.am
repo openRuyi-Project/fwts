@@ -100,7 +100,7 @@ fwts_SOURCES = main.c 				\
 	acpi/erst/erst.c			\
 	acpi/facs/facs.c 			\
 	acpi/fadt/fadt.c 			\
-	brs-i/fadt/fadt.c			\
+	brs/interoperable/fadt/fadt.c		\
 	sbbr/fadt/fadt.c 			\
 	acpi/fan/fan.c 				\
 	acpi/fpdt/fpdt.c 			\
@@ -116,7 +116,7 @@ fwts_SOURCES = main.c 				\
 	acpi/lpit/lpit.c 			\
 	acpi/madt/madt.c			\
 	acpi/mcfg/mcfg.c 			\
-	brs-i/mcfg/mcfg.c			\
+	brs/interoperable/mcfg/mcfg.c		\
 	acpi/mchi/mchi.c 			\
         acpi/misc/misc.c                        \
 	acpi/mpam/mpam.c 			\
@@ -124,7 +124,7 @@ fwts_SOURCES = main.c 				\
 	acpi/msct/msct.c 			\
 	acpi/msdm/msdm.c 			\
 	acpi/method/method.c 			\
-	brs-i/method/method.c 			\
+	brs/interoperable/method/method.c 	\
 	acpi/nfit/nfit.c 			\
 	acpi/nhlt/nhlt.c			\
 	acpi/nhltdump/nhltdump.c 		\
@@ -137,13 +137,13 @@ fwts_SOURCES = main.c 				\
 	acpi/phat/phat.c 			\
 	acpi/pmtt/pmtt.c 			\
 	acpi/pptt/pptt.c 			\
-	brs-i/pptt/pptt.c 			\
+	brs/interoperable/pptt/pptt.c 		\
 	acpi/rasf/rasf.c			\
 	acpi/ras2/ras2.c			\
 	acpi/rgrt/rgrt.c			\
 	acpi/rhct/rhct.c			\
 	acpi/rsdp/rsdp.c			\
-	brs-i/rsdp/rsdp.c			\
+	brs/interoperable/rsdp/rsdp.c		\
 	sbbr/rsdp/rsdp.c			\
 	acpi/rsdt/rsdt.c			\
 	acpi/s3/s3.c 				\
@@ -156,7 +156,7 @@ fwts_SOURCES = main.c 				\
         acpi/slic/slic.c                        \
 	acpi/slit/slit.c 			\
 	acpi/spcr/spcr.c 			\
-	brs-i/spcr/spcr.c			\
+	brs/interoperable/spcr/spcr.c		\
 	acpi/spmi/spmi.c 			\
 	acpi/srat/srat.c 			\
 	acpi/stao/stao.c			\

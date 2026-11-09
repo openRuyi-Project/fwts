@@ -62,7 +62,8 @@ typedef struct {
 	 FWTS_FLAG_COMPLIANCE_ACPI |		\
 	 FWTS_FLAG_SBBR |			\
 	 FWTS_FLAG_EBBR |			\
-	 FWTS_FLAG_BRSI)
+	 FWTS_FLAG_BRSI |			\
+	 FWTS_FLAG_BRSB)
 
 static const fwts_categories categories[] = {
 	{ "ACPI",			FWTS_FLAG_ACPI },
@@ -74,6 +75,7 @@ static const fwts_categories categories[] = {
 	{ "SBBR",			FWTS_FLAG_SBBR },
 	{ "EBBR",			FWTS_FLAG_EBBR },
 	{ "RISC-V BRS-I",		FWTS_FLAG_BRSI },
+	{ "RISC-V BRS-B",		FWTS_FLAG_BRSB },
 	{ "Utilities",			FWTS_FLAG_UTILS },
 	{ "Unsafe",			FWTS_FLAG_UNSAFE },
 	{ "UEFI",			FWTS_FLAG_UEFI },
@@ -145,6 +147,7 @@ static fwts_option fwts_framework_options[] = {
 	{ "clog",		"",   1, "Specify a coreboot logfile dump" },
 	{ "ebbr",		"",   0, "Run EBBR tests." },
 	{ "brs-i",		"",   0, "Run RISC-V BRS-I tests." },
+	{ "brs-b",		"",   0, "Run RISC-V BRS-B tests." },
 	{ NULL, NULL, 0, NULL }
 };
 
@@ -1364,6 +1367,14 @@ int fwts_framework_options_handler(fwts_framework *fw, int argc, char * const ar
 		case 50: /* --brs-i */
 #if defined(FWTS_ARCH_RISCV)
 			fw->flags |= FWTS_FLAG_BRSI;
+			break;
+#else
+			fprintf(stderr, "option not available on this architecture\n");
+			return FWTS_ERROR;
+#endif
+		case 51: /* --brs-b */
+#if defined(FWTS_ARCH_RISCV)
+			fw->flags |= FWTS_FLAG_BRSB;
 			break;
 #else
 			fprintf(stderr, "option not available on this architecture\n");
