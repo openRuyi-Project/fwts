@@ -176,6 +176,7 @@ fwts_SOURCES = main.c 				\
 	acpi/xsdt/xsdt.c			\
 	acpi/xenv/xenv.c			\
 	apic/apicedge/apicedge.c 		\
+	brs/common/devicetree/dt_base.c		\
 	brs/common/hart/hart.c			\
 	bios/bios_info/bios_info.c 		\
 	bios/bios32/bios32.c 			\
