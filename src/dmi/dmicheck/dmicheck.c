@@ -102,7 +102,7 @@ typedef struct {
 
 static bool smbios_found = false;
 static bool smbios30_found = false;
-static uint16_t smbios30_version = 0;
+static uint16_t smbios_entry_version = 0;
 
 /*
  *  Table derived by scanning thousands of DMI table dumps from bug reports
@@ -645,7 +645,6 @@ static int smbios_entry_check(fwts_framework *fw)
 
 	fwts_smbios_entry entry;
 	fwts_smbios_type  type;
-	uint16_t	  version;
 	uint8_t checksum;
 	static char warning[] =
 		"This field is not checked by the kernel, and so will not affect the system, "
@@ -656,7 +655,7 @@ static int smbios_entry_check(fwts_framework *fw)
 		"This test tries to find and sanity check the SMBIOS "
 		"data structures.");
 
-	if ((addr = fwts_smbios_find_entry(fw, &entry, &type, &version)) == NULL)
+	if ((addr = fwts_smbios_find_entry(fw, &entry, &type, &smbios_entry_version)) == NULL)
 		return FWTS_ERROR;
 
 	fwts_passed(fw, "Found SMBIOS Table Entry Point at %p", addr);
@@ -795,7 +794,7 @@ static int smbios30_entry_check(fwts_framework *fw)
 	fwts_smbios30_entry entry;
 	uint8_t checksum;
 
-	if ((addr = fwts_smbios30_find_entry(fw, &entry, &smbios30_version)) == NULL)
+	if ((addr = fwts_smbios30_find_entry(fw, &entry, &smbios_entry_version)) == NULL)
 		return FWTS_ERROR;
 
 	fwts_passed(fw, "Found SMBIOS30 Table Entry Point at %p", addr);
@@ -845,7 +844,6 @@ static int smbios30_entry_check(fwts_framework *fw)
 
 static int dmicheck_test1(fwts_framework *fw)
 {
-
 	if (smbios_entry_check(fw) != FWTS_ERROR) {
 		smbios_found = true;
 	}
@@ -854,10 +852,11 @@ static int dmicheck_test1(fwts_framework *fw)
 		smbios30_found = true;
 	}
 
-	if (!smbios30_found) {
-		if (!(fw->flags & (FWTS_FLAG_SBBR | FWTS_FLAG_BRSI))) {
-			if (smbios_found)
-				return FWTS_OK;
+	if (!smbios_found && !smbios30_found) {
+		if (fw->flags & FWTS_FLAG_BRSB) {
+			fwts_skipped(fw,
+				"SMBIOS is optional for RISC-V BRS-B; skip SMBIOS version check.");
+			return FWTS_OK;
 		}
 		fwts_failed(fw, LOG_LEVEL_HIGH,
 			"SMBIOSNoEntryPoint",
@@ -865,20 +864,27 @@ static int dmicheck_test1(fwts_framework *fw)
 		return FWTS_ERROR;
 	}
 
-	if (fw->flags & FWTS_FLAG_BRSI) {
-		if (smbios30_version < BRS_I_SMBIOS_VERSION_MIN) {
-			fwts_failed(fw, LOG_LEVEL_HIGH, "BrsiSmbiosVersion",
+	if (!smbios30_found && (fw->flags & (FWTS_FLAG_SBBR | FWTS_FLAG_BRSI))) {
+		fwts_failed(fw, LOG_LEVEL_HIGH,
+			"SMBIOSNoEntryPoint",
+			"Could not find SMBIOS 3.0 Table Entry Point.");
+		return FWTS_ERROR;
+	}
+
+	if (fw->flags & (FWTS_FLAG_BRSI | FWTS_FLAG_BRSB)) {
+		if (smbios_entry_version < BRS_I_SMBIOS_VERSION_MIN) {
+			fwts_failed(fw, LOG_LEVEL_HIGH, "BrsSmbiosVersion",
 				"SMBIOS version %" PRIu16 ".%" PRIu16
-				" is below BRS-I minimum 3.7.0.",
-				VERSION_MAJOR(smbios30_version),
-				VERSION_MINOR(smbios30_version));
+				" is below BRS minimum 3.7.0.",
+				VERSION_MAJOR(smbios_entry_version),
+				VERSION_MINOR(smbios_entry_version));
 			return FWTS_ERROR;
 		}
 		fwts_passed(fw,
 			"SMBIOS version %" PRIu16 ".%" PRIu16
-			" meets BRS-I requirement (>= 3.7.0).",
-			VERSION_MAJOR(smbios30_version),
-			VERSION_MINOR(smbios30_version));
+			" meets BRS requirement (>= 3.7.0).",
+			VERSION_MAJOR(smbios_entry_version),
+			VERSION_MINOR(smbios_entry_version));
 	}
 
 	return FWTS_OK;
@@ -2679,6 +2685,6 @@ static fwts_framework_ops dmicheck_ops = {
 	.options_handler = options_handler
 };
 
-FWTS_REGISTER("dmicheck", &dmicheck_ops, FWTS_TEST_ANYTIME, FWTS_FLAG_BATCH | FWTS_FLAG_ROOT_PRIV | FWTS_FLAG_SBBR | FWTS_FLAG_BRSI)
+FWTS_REGISTER("dmicheck", &dmicheck_ops, FWTS_TEST_ANYTIME, FWTS_FLAG_BATCH | FWTS_FLAG_ROOT_PRIV | FWTS_FLAG_SBBR | FWTS_FLAG_BRSI | FWTS_FLAG_BRSB)
 
 #endif
