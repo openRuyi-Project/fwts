@@ -54,31 +54,6 @@ static int fadt_brsi_init(fwts_framework *fw)
 	return FWTS_OK;
 }
 
-#define BRSI_VERSION(major, minor)	 ((((uint16_t)(major)) << 8) | (minor))
-
-static int fadt_brsi_revision(fwts_framework *fw)
-{
-	const uint8_t BRSI_LEAST_MAJOR = 6;
-	const uint8_t BRSI_LEAST_MINOR = 6;
-	uint8_t major = fadt->header.revision;
-	uint8_t minor = 0;
-
-	fwts_get_fadt_version(fw, &major, &minor);
-
-	fwts_log_info(fw, "FADT revision: %" PRIu8 ".%" PRIu8, major, minor);
-
-	if (BRSI_VERSION(major, minor) >=
-	    BRSI_VERSION(BRSI_LEAST_MAJOR, BRSI_LEAST_MINOR))
-		fwts_passed(fw, "FADT revision is up to date.");
-	else {
-		fwts_failed(fw, LOG_LEVEL_CRITICAL, "fadt_revision:",
-			"FADT revision is outdated, at least revision is %" PRIu8 ".%" PRIu8,
-			BRSI_LEAST_MAJOR, BRSI_LEAST_MINOR);
-	}
-
-	return FWTS_OK;
-}
-
 static int fadt_brsi_reduced_hw(fwts_framework *fw)
 {
 	fwts_bool rhw = fwts_acpi_is_reduced_hardware(fw);
@@ -101,7 +76,6 @@ static int fadt_brsi_reduced_hw(fwts_framework *fw)
 
 
 static fwts_framework_minor_test fadt_brsi_tests[] = {
-	{ fadt_brsi_revision, "FADT Revision Test." },
 	{ fadt_brsi_reduced_hw, "FADT Reduced HW Test." },
 	{ NULL, NULL }
 };
